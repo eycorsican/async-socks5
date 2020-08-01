@@ -13,7 +13,10 @@ use std::{
 use tokio::{
     io,
     io::{AsyncReadExt, AsyncWriteExt},
-    net::UdpSocket,
+    net::{
+        UdpSocket,
+        udp::{RecvHalf, SendHalf},
+    },
 };
 
 // Error and Result
@@ -628,9 +631,72 @@ where
 /// A UDP socket that sends packets through a proxy.
 #[derive(Debug)]
 pub struct SocksDatagram<S> {
-    socket: UdpSocket,
+    socket_recv: SocksDatagramRecvHalf,
+    socket_send: SocksDatagramSendHalf,
     proxy_addr: AddrKind,
     stream: S,
+}
+
+#[derive(Debug)]
+pub struct SocksDatagramRecvHalf {
+    socket: RecvHalf,
+}
+
+impl SocksDatagramRecvHalf {
+    pub async fn recv_from(&mut self, buf: &mut [u8]) -> Result<(usize, AddrKind)> {
+        let mut bytes = Self::alloc_buf(AddrKind::MAX_SIZE, buf.len());
+        let len = self.socket.recv(&mut bytes).await?;
+
+        let mut cursor = Cursor::new(bytes);
+        cursor.read_reserved().await?;
+        cursor.read_reserved().await?;
+        cursor.read_fragment_id().await?;
+        let addr = cursor.read_target_addr().await?;
+        let header_len = cursor.position() as usize;
+        cursor.read_exact(buf).await?;
+        Ok((len - header_len, addr))
+    }
+    fn alloc_buf(addr_size: usize, buf_len: usize) -> Vec<u8> {
+        vec![
+            0;
+            2 // reserved
+                + 1 // fragment id
+                + addr_size
+                + buf_len
+        ]
+    }
+}
+
+#[derive(Debug)]
+pub struct SocksDatagramSendHalf {
+    socket: SendHalf,
+}
+
+impl SocksDatagramSendHalf {
+    pub async fn send_to<A>(&mut self, buf: &[u8], addr: A) -> Result<usize>
+    where
+        A: Into<AddrKind>,
+    {
+        let addr: AddrKind = addr.into();
+
+        let mut cursor = Cursor::new(Self::alloc_buf(addr.size(), buf.len()));
+        cursor.write_reserved().await?;
+        cursor.write_reserved().await?;
+        cursor.write_fragment_id().await?;
+        cursor.write_target_addr(&addr).await?;
+        cursor.write_all(buf).await?;
+        let bytes = cursor.into_inner();
+        Ok(self.socket.send(&bytes).await?)
+    }
+    fn alloc_buf(addr_size: usize, buf_len: usize) -> Vec<u8> {
+        vec![
+            0;
+            2 // reserved
+                + 1 // fragment id
+                + addr_size
+                + buf_len
+        ]
+    }
 }
 
 impl<S> SocksDatagram<S>
@@ -654,8 +720,12 @@ where
             .unwrap_or_else(|| AddrKind::Ip(SocketAddr::new(IpAddr::from([0, 0, 0, 0]), 0)));
         let proxy_addr = init(&mut proxy_stream, Command::UdpAssociate, addr, auth).await?;
         socket.connect(proxy_addr.to_socket_addr()).await?;
+        let (socket_recv, socket_send) = socket.split();
+        let socket_recv = SocksDatagramRecvHalf {socket: socket_recv};
+        let socket_send = SocksDatagramSendHalf {socket: socket_send};
         Ok(Self {
-            socket,
+            socket_recv,
+            socket_send,
             proxy_addr,
             stream: proxy_stream,
         })
@@ -665,46 +735,27 @@ where
         &self.proxy_addr
     }
 
-    pub fn get_ref(&self) -> &UdpSocket {
-        &self.socket
-    }
+    // pub fn get_ref(&self) -> &UdpSocket {
+    //     &self.socket
+    // }
 
-    pub fn get_mut(&mut self) -> &mut UdpSocket {
-        &mut self.socket
-    }
+    // pub fn get_mut(&mut self) -> &mut UdpSocket {
+    //     &mut self.socket
+    // }
 
-    pub fn into_inner(self) -> (S, UdpSocket) {
-        (self.stream, self.socket)
-    }
+    // pub fn into_inner(self) -> (S, UdpSocket) {
+    //     (self.stream, self.socket)
+    // }
 
     pub async fn send_to<A>(&mut self, buf: &[u8], addr: A) -> Result<usize>
     where
         A: Into<AddrKind>,
     {
-        let addr: AddrKind = addr.into();
-
-        let mut cursor = Cursor::new(Self::alloc_buf(addr.size(), buf.len()));
-        cursor.write_reserved().await?;
-        cursor.write_reserved().await?;
-        cursor.write_fragment_id().await?;
-        cursor.write_target_addr(&addr).await?;
-        cursor.write_all(buf).await?;
-        let bytes = cursor.into_inner();
-        Ok(self.socket.send(&bytes).await?)
+        self.socket_send.send_to(buf, addr).await
     }
 
     pub async fn recv_from(&mut self, buf: &mut [u8]) -> Result<(usize, AddrKind)> {
-        let mut bytes = Self::alloc_buf(AddrKind::MAX_SIZE, buf.len());
-        let len = self.socket.recv(&mut bytes).await?;
-
-        let mut cursor = Cursor::new(bytes);
-        cursor.read_reserved().await?;
-        cursor.read_reserved().await?;
-        cursor.read_fragment_id().await?;
-        let addr = cursor.read_target_addr().await?;
-        let header_len = cursor.position() as usize;
-        cursor.read_exact(buf).await?;
-        Ok((len - header_len, addr))
+        self.socket_recv.recv_from(buf).await
     }
 
     fn alloc_buf(addr_size: usize, buf_len: usize) -> Vec<u8> {
@@ -715,6 +766,10 @@ where
                 + addr_size
                 + buf_len
         ]
+    }
+
+    pub fn split(self) -> (SocksDatagramRecvHalf, SocksDatagramSendHalf) {
+        (self.socket_recv, self.socket_send)
     }
 }
 
