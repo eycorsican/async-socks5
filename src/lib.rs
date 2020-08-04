@@ -9,6 +9,7 @@ use std::{
     io::Cursor,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6},
     string::FromUtf8Error,
+    sync::Arc,
 };
 use tokio::{
     io,
@@ -631,18 +632,18 @@ where
 /// A UDP socket that sends packets through a proxy.
 #[derive(Debug)]
 pub struct SocksDatagram<S> {
-    socket_recv: SocksDatagramRecvHalf,
-    socket_send: SocksDatagramSendHalf,
+    socket_recv: SocksDatagramRecvHalf<S>,
+    socket_send: SocksDatagramSendHalf<S>,
     proxy_addr: AddrKind,
-    stream: S,
 }
 
 #[derive(Debug)]
-pub struct SocksDatagramRecvHalf {
+pub struct SocksDatagramRecvHalf<S> {
     socket: RecvHalf,
+    stream: Arc<S>,
 }
 
-impl SocksDatagramRecvHalf {
+impl<S> SocksDatagramRecvHalf<S> {
     pub async fn recv_from(&mut self, buf: &mut [u8]) -> Result<(usize, AddrKind)> {
         let mut bytes = Self::alloc_buf(AddrKind::MAX_SIZE, buf.len());
         let len = self.socket.recv(&mut bytes).await?;
@@ -668,11 +669,12 @@ impl SocksDatagramRecvHalf {
 }
 
 #[derive(Debug)]
-pub struct SocksDatagramSendHalf {
+pub struct SocksDatagramSendHalf<S> {
     socket: SendHalf,
+    stream: Arc<S>,
 }
 
-impl SocksDatagramSendHalf {
+impl<S> SocksDatagramSendHalf<S> {
     pub async fn send_to<A>(&mut self, buf: &[u8], addr: A) -> Result<usize>
     where
         A: Into<AddrKind>,
@@ -721,13 +723,13 @@ where
         let proxy_addr = init(&mut proxy_stream, Command::UdpAssociate, addr, auth).await?;
         socket.connect(proxy_addr.to_socket_addr()).await?;
         let (socket_recv, socket_send) = socket.split();
-        let socket_recv = SocksDatagramRecvHalf {socket: socket_recv};
-        let socket_send = SocksDatagramSendHalf {socket: socket_send};
+        let stream = Arc::new(proxy_stream);
+        let socket_recv = SocksDatagramRecvHalf {socket: socket_recv, stream: stream.clone() };
+        let socket_send = SocksDatagramSendHalf {socket: socket_send, stream: stream };
         Ok(Self {
             socket_recv,
             socket_send,
             proxy_addr,
-            stream: proxy_stream,
         })
     }
 
@@ -768,7 +770,7 @@ where
         ]
     }
 
-    pub fn split(self) -> (SocksDatagramRecvHalf, SocksDatagramSendHalf) {
+    pub fn split(self) -> (SocksDatagramRecvHalf<S>, SocksDatagramSendHalf<S>) {
         (self.socket_recv, self.socket_send)
     }
 }
